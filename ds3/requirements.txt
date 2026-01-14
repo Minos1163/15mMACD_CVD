@@ -1,0 +1,10 @@
+openai
+pandas
+schedule
+python-dotenv
+requests
+numpy
+matplotlib
+binance-common
+binance-sdk-derivatives-trading-usds-futures
+Flask

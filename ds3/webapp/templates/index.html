@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DS3 监控面板</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1021;
+      --panel: #0f172a;
+      --border: #1f2937;
+      --muted: #94a3b8;
+      --text: #e2e8f0;
+      --accent: #7c3aed;
+      --accent-2: #22c55e;
+      --danger: #ef4444;
+      --shadow: 0 15px 60px rgba(0,0,0,0.45);
+      --radius: 16px;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: "Inter", -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 0; background: radial-gradient(circle at 20% 20%, rgba(124,58,237,0.08), transparent 25%), radial-gradient(circle at 80% 0%, rgba(34,197,94,0.08), transparent 22%), var(--bg); color: var(--text); }
+    header { padding: 16px 24px; background: rgba(15,23,42,0.9); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; backdrop-filter: blur(8px); z-index: 10; }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0.3px; display: flex; align-items: center; gap: 8px; }
+    main { padding: 18px 24px 32px; display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; align-items: start; }
+    section { background: linear-gradient(135deg, rgba(17,24,39,0.95), rgba(17,24,39,0.85)); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow); }
+    section h2 { margin-top: 0; font-size: 15px; color: #c4d3ff; letter-spacing: 0.2px; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
+    input, select { width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0b1220; color: var(--text); margin-bottom: 12px; transition: border 0.15s, box-shadow 0.15s; }
+    input:focus, select:focus { outline: none; border-color: rgba(124,58,237,0.7); box-shadow: 0 0 0 3px rgba(124,58,237,0.18); }
+    button { padding: 11px 14px; border: none; border-radius: 10px; cursor: pointer; font-weight: 700; letter-spacing: 0.2px; }
+    .primary { background: linear-gradient(135deg, #7c3aed, #6366f1); color: #fff; box-shadow: 0 10px 30px rgba(99,102,241,0.35); }
+    .danger { background: linear-gradient(135deg, #f43f5e, #ef4444); color: #fff; box-shadow: 0 10px 30px rgba(239,68,68,0.35); }
+    .ghost { background: transparent; color: var(--text); border: 1px solid #334155; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    #logs { font-family: "JetBrains Mono", "Fira Code", monospace; background: #0b1220; color: #cbd5e1; padding: 12px; border-radius: 12px; height: 320px; overflow: auto; white-space: pre-wrap; border: 1px solid var(--border); box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border-radius: 999px; background: #0b1220; border: 1px solid #334155; font-size: 12px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 999px; background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.35); color: #d8b4fe; font-size: 12px; }
+    .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .subtext { color: var(--muted); font-size: 12px; }
+    .chart-wrap { background: #0b1220; border: 1px solid var(--border); border-radius: 12px; padding: 10px; }
+    footer { padding: 12px 24px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); background: var(--bg); }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body data-require-token="{{ 'true' if require_token else 'false' }}">
+  <header>
+    <h1>🛰️ DS3 监控面板</h1>
+    <div class="row" style="align-items:center; gap:10px;">
+      <input id="api_token" placeholder="API Token (可选)" style="width:220px; margin:0;" />
+      <button class="ghost" onclick="saveToken()">保存 Token</button>
+      <div class="badge" id="status-badge">状态: 未知</div>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <div class="card-head"><h2>参数配置</h2><span class="pill">实时保存到 config_override.json</span></div>
+      <div class="grid-2">
+        <div>
+          <label>交易对</label>
+          <input id="symbol" placeholder="ETH/USDT:USDT" />
+        </div>
+        <div>
+          <label>杠杆</label>
+          <input id="leverage" type="number" step="1" min="1" />
+        </div>
+        <div>
+          <label>K线周期</label>
+          <input id="timeframe" placeholder="15m" />
+        </div>
+        <div>
+          <label>仓位占用%</label>
+          <input id="position_usage_pct" type="number" step="0.1" />
+        </div>
+        <div>
+          <label>默认止损%</label>
+          <input id="stop_loss_default_pct" type="number" step="0.1" />
+        </div>
+        <div>
+          <label>默认止盈%</label>
+          <input id="take_profit_default_pct" type="number" step="0.1" />
+        </div>
+        <div>
+          <label>追踪触发%</label>
+          <input id="trigger_pct" type="number" step="0.05" />
+        </div>
+        <div>
+          <label>追踪回吐%</label>
+          <input id="callback_pct" type="number" step="0.05" />
+        </div>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="loadConfig()">刷新配置</button>
+        <button class="primary" onclick="saveConfig()">保存配置</button>
+      </div>
+
+      <div class="card-head" style="margin-top:14px;">
+        <h2>PnL / Equity 曲线</h2>
+        <span class="subtext">从日志中提取包含 pnl / equity / balance 的行</span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="pnlChart" height="180"></canvas>
+      </div>
+    </section>
+
+    <section>
+      <div class="card-head"><h2>控制与状态</h2><span class="pill" id="auth-pill">认证: 未开启</span></div>
+      <div class="row" style="margin-bottom:12px;">
+        <button class="primary" onclick="startBot()">启动脚本</button>
+        <button class="danger" onclick="stopBot()">停止脚本</button>
+      </div>
+      <div class="row" style="margin-bottom:12px;">
+        <button class="ghost" onclick="refreshStatus()">刷新状态</button>
+        <button class="ghost" onclick="loadLogs()">刷新日志</button>
+        <button class="ghost" onclick="loadPnl()">刷新 PnL</button>
+      </div>
+      <h2>实时日志</h2>
+      <div id="logs">加载中...</div>
+    </section>
+  </main>
+
+  <footer>
+    运行脚本: <code>/root/ds3/ds3.py</code> · 覆盖配置: <code>/root/ds3/config_override.json</code> · API 端口默认为 8000 · 支持 Token 认证 (WEB_API_TOKEN)
+  </footer>
+
+  <script>
+    let apiToken = localStorage.getItem('ds3_token') || '';
+    const tokenInput = document.getElementById('api_token');
+    tokenInput.value = apiToken;
+
+    function saveToken() {
+      apiToken = tokenInput.value.trim();
+      localStorage.setItem('ds3_token', apiToken);
+      restartLogStream();
+      updateAuthPill();
+      alert('Token 已保存到本地浏览器');
+    }
+
+    function authFetch(url, options = {}) {
+      const headers = options.headers || {};
+      if (apiToken) headers['Authorization'] = `Bearer ${apiToken}`;
+      return fetch(url, { ...options, headers });
+    }
+
+    async function refreshStatus() {
+      const res = await authFetch('/api/status');
+      const data = await res.json();
+      const badge = document.getElementById('status-badge');
+      if (data.running) {
+        badge.textContent = `状态: 运行中 (PID ${data.pid})`;
+        badge.style.borderColor = '#22c55e';
+        badge.style.color = '#bbf7d0';
+      } else {
+        badge.textContent = '状态: 已停止';
+        badge.style.borderColor = '#f87171';
+        badge.style.color = '#fecdd3';
+      }
+    }
+
+    async function loadConfig() {
+      const res = await authFetch('/api/config');
+      const cfg = await res.json();
+      document.getElementById('symbol').value = cfg.symbol || '';
+      document.getElementById('leverage').value = cfg.leverage || '';
+      document.getElementById('timeframe').value = cfg.timeframe || '';
+      document.getElementById('position_usage_pct').value = cfg.position_management?.position_usage_pct ?? '';
+      document.getElementById('stop_loss_default_pct').value = cfg.risk_control?.stop_loss_default_pct ?? '';
+      document.getElementById('take_profit_default_pct').value = cfg.risk_control?.take_profit_default_pct ?? '';
+      document.getElementById('trigger_pct').value = cfg.trailing_stop?.trigger_pct ?? '';
+      document.getElementById('callback_pct').value = cfg.trailing_stop?.callback_pct ?? '';
+    }
+
+    async function saveConfig() {
+      const payload = {
+        symbol: document.getElementById('symbol').value,
+        leverage: Number(document.getElementById('leverage').value),
+        timeframe: document.getElementById('timeframe').value,
+        position_management: {
+          position_usage_pct: Number(document.getElementById('position_usage_pct').value),
+        },
+        risk_control: {
+          stop_loss_default_pct: Number(document.getElementById('stop_loss_default_pct').value),
+          take_profit_default_pct: Number(document.getElementById('take_profit_default_pct').value),
+        },
+        trailing_stop: {
+          trigger_pct: Number(document.getElementById('trigger_pct').value),
+          callback_pct: Number(document.getElementById('callback_pct').value),
+        },
+      };
+      const res = await authFetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      alert(res.ok ? '已保存配置并写入 config_override.json' : '保存失败');
+    }
+
+    async function loadLogs() {
+      const res = await authFetch('/api/logs?lines=200');
+      const data = await res.json();
+      const box = document.getElementById('logs');
+      box.textContent = data.lines ? data.lines.join('') : '无日志';
+      box.scrollTop = box.scrollHeight;
+    }
+
+    let logStream;
+    function restartLogStream() {
+      if (logStream) logStream.close();
+      const url = apiToken ? `/api/logs/stream?token=${encodeURIComponent(apiToken)}` : '/api/logs/stream';
+      logStream = new EventSource(url);
+      logStream.onmessage = (e) => {
+        const box = document.getElementById('logs');
+        box.textContent += (e.data + '\n');
+        box.scrollTop = box.scrollHeight;
+      };
+      logStream.onerror = () => {
+        logStream.close();
+        setTimeout(restartLogStream, 2500);
+      };
+    }
+
+    async function startBot() {
+      const res = await authFetch('/api/start', { method: 'POST' });
+      const data = await res.json();
+      alert(data.message || (data.ok ? '已启动' : '启动失败'));
+      refreshStatus();
+    }
+
+    async function stopBot() {
+      const res = await authFetch('/api/stop', { method: 'POST' });
+      const data = await res.json();
+      alert(data.message || (data.ok ? '已停止' : '停止失败'));
+      refreshStatus();
+    }
+
+    let pnlChart;
+    function initChart() {
+      const ctx = document.getElementById('pnlChart');
+      pnlChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'PnL / Equity', data: [], borderColor: '#7c3aed', backgroundColor: 'rgba(124,58,237,0.1)', tension: 0.25, fill: true, pointRadius: 2 }] },
+        options: { plugins: { legend: { labels: { color: '#e2e8f0' } } }, scales: { x: { ticks: { color: '#cbd5e1', maxRotation: 0 }, grid: { color: 'rgba(255,255,255,0.05)' } }, y: { ticks: { color: '#cbd5e1' }, grid: { color: 'rgba(255,255,255,0.05)' } } } }
+      });
+    }
+
+    async function loadPnl() {
+      const res = await authFetch('/api/pnl');
+      const data = await res.json();
+      if (!pnlChart) return;
+      const labels = data.points?.map(p => p.t) || [];
+      const values = data.points?.map(p => p.v) || [];
+      pnlChart.data.labels = labels;
+      pnlChart.data.datasets[0].data = values;
+      pnlChart.update();
+    }
+
+    function updateAuthPill() {
+      const pill = document.getElementById('auth-pill');
+      const requireToken = document.body.dataset.requireToken === 'true';
+      if (requireToken) {
+        pill.textContent = apiToken ? '认证: 已设置 Token' : '认证: 需要 Token';
+        pill.style.background = apiToken ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)';
+        pill.style.borderColor = apiToken ? 'rgba(34,197,94,0.4)' : 'rgba(239,68,68,0.4)';
+        pill.style.color = apiToken ? '#befae3' : '#fecdd3';
+      } else {
+        pill.textContent = '认证: 未开启';
+      }
+    }
+
+    // init
+    updateAuthPill();
+    refreshStatus();
+    loadConfig();
+    loadLogs();
+    initChart();
+    loadPnl();
+    restartLogStream();
+    setInterval(refreshStatus, 5000);
+    setInterval(loadPnl, 10000);
+  </script>
+</body>
+</html>
