@@ -213,6 +213,36 @@ def test_confluence_ignores_ma10_bias_for_hard_block():
     assert confluence["confluence_macd_trigger_long"] is True
 
 
+def test_confluence_accepts_hist_flip_as_early_long_before_cross():
+    engine = FundFlowDecisionEngine(_cfg())
+    confluence = engine._compute_entry_confluence_v2(
+        "BTCUSDT",
+        market_flow_context={
+            "_ma10_macd_confluence": {
+                "last_close_1h": 101.0,
+                "ma10_1h": 100.0,
+                "ma10_1h_bias": 1,
+                "macd_5m": -0.02,
+                "macd_5m_signal": -0.01,
+                "macd_5m_hist": 0.01,
+                "macd_5m_hist_delta": 0.02,
+                "macd_5m_hist_delta_norm": 0.42,
+                "macd_5m_hist_flip_up": True,
+                "macd_5m_bullish_divergence": False,
+                "kdj_k": 55.0,
+                "kdj_d": 50.0,
+                "kdj_j": 62.0,
+            },
+            "timeframes": {"15m": {}, "1h": {}},
+        },
+        cfg=engine._trend_capture_config(),
+    )
+    assert confluence["confluence_macd_trigger_long"] is False
+    assert confluence["confluence_macd_early_long"] is True
+    assert confluence["confluence_macd_flip_long"] is True
+    assert confluence["confluence_macd_reversal_score_long"] >= 0.42
+
+
 def test_resolve_entry_mode_prunes_opposite_short_capture_when_confluence_fallback_turns_long():
     cfg = _cfg()
     cfg["fund_flow"]["long_open_threshold"] = 0.07
@@ -351,6 +381,44 @@ def test_resolve_entry_mode_blocks_short_without_3m_confirm_when_required():
     assert resolved.metadata["decision_source"] == "trend_short_confirm_blocked"
     assert resolved.metadata["short_entry_confirm_3m_required"] is True
     assert resolved.metadata["short_entry_confirm_gate_pass"] is False
+
+
+def test_resolve_entry_mode_does_not_apply_hidden_short_threshold_boost():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["short_open_threshold"] = 0.068
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "short_min_score_boost": 0.01,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="SOLUSDT",
+        regime_info={"regime": "TREND", "cvd_norm": -0.3},
+        base_scores={"long_score": 0.0, "short_score": 0.09},
+        trend_pending={"trend_pending_side": "NONE", "trend_pending_score": 0.0},
+        trend_capture={
+            "trend_capture_score_long": 0.0,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_short": True,
+            "trend_capture_pullback_resume_short": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.SELL
+    assert resolved.metadata["short_entry_score_threshold"] == 0.068
+    assert resolved.metadata["short_entry_score_threshold_configured"] == 0.068
+    assert resolved.metadata["short_entry_score_threshold_legacy_boost"] == 0.01
+    assert resolved.metadata["short_entry_score_threshold_legacy_boost_applied"] is False
+    assert resolved.metadata["final_short_score"] < 0.078
 
 
 def test_resolve_entry_mode_injects_long_confluence_fallback_into_entry_score():
@@ -916,6 +984,57 @@ def test_resolve_entry_mode_blocks_entry_without_breakout_or_pullback():
     assert "no_breakout_no_pullback_long" in resolved.metadata["entry_hard_filters"]
 
 
+def test_resolve_entry_mode_exempts_breakout_filter_with_strong_macd_reversal():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+        "macd_reversal_exempt_enabled": True,
+        "macd_reversal_exempt_long_score": 0.16,
+        "macd_reversal_exempt_min_strength": 0.55,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 1,
+            "cvd_norm": 0.18,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+        },
+        base_scores={"long_score": 0.22, "short_score": 0.0},
+        trend_pending={
+            "trend_pending_side": "LONG",
+            "trend_pending_score": 0.62,
+            "trend_pending_adx_slope": -0.08,
+        },
+        trend_capture={
+            "trend_capture_score_long": 0.18,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": False,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+            "confluence_macd_reversal_score_long": 0.72,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.BUY
+    assert resolved.metadata["decision_source"] != "entry_hard_filter_blocked"
+    assert "no_breakout_no_pullback_long" not in resolved.metadata["entry_hard_filters"]
+    assert "adx_slope_below_required" not in resolved.metadata["entry_hard_filters"]
+
+
 def test_resolve_entry_mode_blocks_long_when_strict_trend_requirements_fail():
     cfg = _cfg()
     cfg["fund_flow"]["long_open_threshold"] = 0.07
@@ -926,6 +1045,7 @@ def test_resolve_entry_mode_blocks_long_when_strict_trend_requirements_fail():
         "required_price_oi_alignment_15m": 1.0,
         "required_adx_slope": 0.05,
         "required_long_ema_spread_expand": 0.0,
+        "entry_high_score_exempt_long": 0.2,
         "min_score": 0.08,
         "min_gap": 0.02,
         "base_score_floor_mult": 0.85,

@@ -454,6 +454,13 @@ class FundFlowDecisionEngine:
             "block_on_opposite_bias": bool(conf.get("block_on_opposite_bias", False)),
             "entry_require_macd_trigger": bool(conf.get("entry_require_macd_trigger", False)),
             "entry_allow_macd_early": bool(conf.get("entry_allow_macd_early", True)),
+            "entry_macd_hist_delta_norm_min": self._to_float(conf.get("entry_macd_hist_delta_norm_min"), 0.12),
+            "entry_macd_flip_hist_min": self._to_float(conf.get("entry_macd_flip_hist_min"), 0.0),
+            "entry_macd_divergence_enabled": bool(conf.get("entry_macd_divergence_enabled", True)),
+            "entry_macd_divergence_delta_norm_min": self._to_float(
+                conf.get("entry_macd_divergence_delta_norm_min"),
+                0.08,
+            ),
             "entry_soft_penalty_macd_early": self._to_float(conf.get("entry_soft_penalty_macd_early"), 0.03),
             "entry_soft_penalty_no_macd": self._to_float(conf.get("entry_soft_penalty_no_macd"), 0.08),
             "entry_soft_penalty_no_kdj": self._to_float(conf.get("entry_soft_penalty_no_kdj"), 0.04),
@@ -505,6 +512,10 @@ class FundFlowDecisionEngine:
                     0.14,
                 ),
             ),
+            "macd_reversal_exempt_enabled": bool(tc.get("macd_reversal_exempt_enabled", True)),
+            "macd_reversal_exempt_long_score": self._to_float(tc.get("macd_reversal_exempt_long_score"), 0.16),
+            "macd_reversal_exempt_short_score": self._to_float(tc.get("macd_reversal_exempt_short_score"), 0.16),
+            "macd_reversal_exempt_min_strength": self._to_float(tc.get("macd_reversal_exempt_min_strength"), 0.55),
             "adx_strong_trend_exempt": self._to_float(
                 tc.get("adx_strong_trend_exempt"),
                 self._to_float(regime.get("adx_trend_on"), self.regime_adx_trend_on) + 2.0,
@@ -773,7 +784,229 @@ class FundFlowDecisionEngine:
             "long_score": min(max(long_score, 0.0), 1.0),
             "short_score": min(max(short_score, 0.0), 1.0),
         }
-    
+
+    def _detect_macd_divergence(
+        self,
+        price_series: list,
+        hist_series: list,
+        lookback: int = 5,
+    ) -> dict:
+        """
+        检测 MACD 柱子背离
+        返回:
+          bearish_div: bool  顶背离（价格新高 + 柱子未新高）
+          bullish_div: bool  底背离（价格新低 + 柱子未新低）
+        """
+        if len(price_series) < lookback or len(hist_series) < lookback:
+            return {"bearish_div": False, "bullish_div": False}
+
+        recent_prices = price_series[-lookback:]
+        recent_hists = hist_series[-lookback:]
+
+        if len(recent_prices) < 2 or len(recent_hists) < 2:
+            return {"bearish_div": False, "bullish_div": False}
+
+        try:
+            price_new_high = recent_prices[-1] >= max(recent_prices[:-1])
+            price_new_low = recent_prices[-1] <= min(recent_prices[:-1])
+            hist_new_high = recent_hists[-1] >= max(recent_hists[:-1])
+            hist_new_low = recent_hists[-1] <= min(recent_hists[:-1])
+
+            bearish_divergence = bool(price_new_high and (not hist_new_high))
+            bullish_divergence = bool(price_new_low and (not hist_new_low))
+        except (TypeError, ValueError):
+            return {"bearish_div": False, "bullish_div": False}
+
+        return {
+            "bearish_div": bearish_divergence,
+            "bullish_div": bullish_divergence,
+        }
+
+    def _classify_macd_state(
+        self,
+        hist: float,
+        hist_prev: float,
+        threshold: float = 0.0,
+    ) -> str:
+        """
+        分类 MACD 柱子状态
+        返回: MACDState 枚举值
+        """
+        if hist_prev <= threshold and hist > threshold:
+            return "FLIP_TO_BULL"  # 柱子翻红
+        if hist_prev >= -threshold and hist < -threshold:
+            return "FLIP_TO_BEAR"  # 柱子翻绿
+        if hist > threshold:
+            return "BULL_STRONG" if hist >= hist_prev else "BULL_WEAK"
+        if hist < -threshold:
+            return "BEAR_STRONG" if abs(hist) >= abs(hist_prev) else "BEAR_WEAK"
+        return "NEUTRAL"
+
+    def _compute_macd_multitf_signal(
+        self,
+        market_flow_context: Dict[str, Any],
+        intended_long: bool,
+        intended_short: bool,
+        cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        计算 MACD 多周期信号 (V3.1 新增)
+        返回:
+          long_bonus: float  做多加分
+          short_bonus: float  做空加分
+          long_penalty: float  做多惩罚
+          short_penalty: float  做空惩罚
+          hard_block_long: bool  4H 背离 HARD_BLOCK 做多
+          hard_block_short: bool  4H 背离 HARD_BLOCK 做空
+          high_conf_long: bool  高置信度做多组合
+          high_conf_short: bool  高置信度做空组合
+        """
+        macd_cfg = cfg or self.config.get("fund_flow", {}).get("macd_multitf", {})
+        if not bool(macd_cfg.get("enabled", True)):
+            return {
+                "long_bonus": 0.0,
+                "short_bonus": 0.0,
+                "long_penalty": 0.0,
+                "short_penalty": 0.0,
+                "hard_block_long": False,
+                "hard_block_short": False,
+                "high_conf_long": False,
+                "high_conf_short": False,
+            }
+
+        # 从 market_flow_context 中提取 1H 和 4H MACD 数据
+        timeframes = market_flow_context.get("timeframes", {})
+        tf_1h = timeframes.get("1h", {}) if isinstance(timeframes, dict) else {}
+        tf_4h = timeframes.get("4h", {}) if isinstance(timeframes, dict) else {}
+
+        # 提取 1H MACD 数据
+        macd_1h_line = self._to_float(tf_1h.get("macd"), 0.0)
+        macd_1h_signal = self._to_float(tf_1h.get("macd_signal"), 0.0)
+        macd_1h_hist = self._to_float(tf_1h.get("macd_hist"), 0.0)
+        macd_1h_hist_prev = self._to_float(tf_1h.get("prev", {}).get("macd_hist"), macd_1h_hist)
+
+        price_1h_series = tf_1h.get("close_series", [])
+        hist_1h_series = tf_1h.get("macd_hist_series", [])
+
+        # 提取 4H MACD 数据
+        macd_4h_line = self._to_float(tf_4h.get("macd"), 0.0)
+        macd_4h_signal = self._to_float(tf_4h.get("macd_signal"), 0.0)
+        macd_4h_hist = self._to_float(tf_4h.get("macd_hist"), 0.0)
+        macd_4h_hist_prev = self._to_float(tf_4h.get("prev", {}).get("macd_hist"), macd_4h_hist)
+        price_4h_series = tf_4h.get("close_series", [])
+        hist_4h_series = tf_4h.get("macd_hist_series", [])
+
+        # 获取配置参数
+        macd_1h_cfg = macd_cfg.get("macd_1h", {})
+        macd_4h_cfg = macd_cfg.get("macd_4h", {})
+
+        high_confidence_bonus = self._to_float(macd_cfg.get("high_confidence_bonus"), 0.06)
+
+        # 初始化结果
+        long_bonus = 0.0
+        short_bonus = 0.0
+        long_penalty = 0.0
+        short_penalty = 0.0
+        hard_block_long = False
+        hard_block_short = False
+        high_conf_long = False
+        high_conf_short = False
+        macd_1h_direction = "NEUTRAL"
+        macd_4h_direction = "NEUTRAL"
+
+        # 计算 1H MACD 状态和信号
+        macd_1h_state = self._classify_macd_state(macd_1h_hist, macd_1h_hist_prev)
+        if macd_1h_state == "FLIP_TO_BULL":
+            long_bonus += self._to_float(macd_1h_cfg.get("flip_bull_bonus"), 0.03)
+            macd_1h_direction = "BULL"
+        elif macd_1h_state == "FLIP_TO_BEAR":
+            short_bonus += self._to_float(macd_1h_cfg.get("flip_bear_bonus"), 0.03)
+            macd_1h_direction = "BEAR"
+        elif macd_1h_state in ("BULL_STRONG", "BULL_WEAK"):
+            long_bonus += self._to_float(macd_1h_cfg.get("align_bull_bonus"), 0.015)
+            macd_1h_direction = "BULL"
+        elif macd_1h_state in ("BEAR_STRONG", "BEAR_WEAK"):
+            short_bonus += self._to_float(macd_1h_cfg.get("align_bear_bonus"), 0.015)
+            macd_1h_direction = "BEAR"
+
+        # 计算 4H MACD 状态和信号
+        macd_4h_state = self._classify_macd_state(macd_4h_hist, macd_4h_hist_prev)
+        if macd_4h_state == "FLIP_TO_BULL":
+            long_bonus += self._to_float(macd_4h_cfg.get("flip_bull_bonus"), 0.04)
+            macd_4h_direction = "BULL"
+        elif macd_4h_state == "FLIP_TO_BEAR":
+            short_bonus += self._to_float(macd_4h_cfg.get("flip_bear_bonus"), 0.04)
+            macd_4h_direction = "BEAR"
+        elif macd_4h_state in ("BULL_STRONG", "BULL_WEAK"):
+            long_bonus += self._to_float(macd_4h_cfg.get("align_bull_bonus"), 0.02)
+            macd_4h_direction = "BULL"
+        elif macd_4h_state in ("BEAR_STRONG", "BEAR_WEAK"):
+            short_bonus += self._to_float(macd_4h_cfg.get("align_bear_bonus"), 0.02)
+            macd_4h_direction = "BEAR"
+
+        # 1H/4H 方向不一致惩罚
+        against_penalty_1h = self._to_float(macd_1h_cfg.get("against_penalty"), 0.02)
+        against_penalty_4h = self._to_float(macd_4h_cfg.get("against_penalty"), 0.04)
+
+        if macd_4h_direction == "BEAR" and intended_long:
+            long_penalty += against_penalty_4h
+        if macd_4h_direction == "BULL" and intended_short:
+            short_penalty += against_penalty_4h
+        if macd_1h_direction == "BEAR" and intended_long:
+            long_penalty += against_penalty_1h
+        if macd_1h_direction == "BULL" and intended_short:
+            short_penalty += against_penalty_1h
+
+        # 1H 背离检测
+        div_1h = self._detect_macd_divergence(
+            price_1h_series, hist_1h_series,
+            lookback=int(macd_1h_cfg.get("lookback_divergence", 6))
+        )
+        divergence_penalty_1h = self._to_float(macd_1h_cfg.get("divergence_penalty"), 0.05)
+        if div_1h["bearish_div"] and intended_long:
+            long_penalty += divergence_penalty_1h
+        if div_1h["bullish_div"] and intended_short:
+            short_penalty += divergence_penalty_1h
+
+        # 4H 背离检测 → HARD_BLOCK
+        div_4h = self._detect_macd_divergence(
+            price_4h_series, hist_4h_series,
+            lookback=int(macd_4h_cfg.get("lookback_divergence", 4))
+        )
+        hard_block_divergence_4h = bool(macd_4h_cfg.get("hard_block_divergence", True))
+        if hard_block_divergence_4h:
+            if div_4h["bearish_div"] and intended_long:
+                hard_block_long = True
+            if div_4h["bullish_div"] and intended_short:
+                hard_block_short = True
+
+        # 高置信度组合信号 (背离 + 翻色)
+        if div_4h["bearish_div"] and macd_1h_state == "FLIP_TO_BEAR" and intended_short:
+            short_bonus += high_confidence_bonus
+            high_conf_short = True
+        if div_4h["bullish_div"] and macd_1h_state == "FLIP_TO_BULL" and intended_long:
+            long_bonus += high_confidence_bonus
+            high_conf_long = True
+
+        return {
+            "long_bonus": round(long_bonus, 4),
+            "short_bonus": round(short_bonus, 4),
+            "long_penalty": round(long_penalty, 4),
+            "short_penalty": round(short_penalty, 4),
+            "hard_block_long": hard_block_long,
+            "hard_block_short": hard_block_short,
+            "high_conf_long": high_conf_long,
+            "high_conf_short": high_conf_short,
+            "macd_1h_state": macd_1h_state,
+            "macd_4h_state": macd_4h_state,
+            "macd_1h_direction": macd_1h_direction,
+            "macd_4h_direction": macd_4h_direction,
+            "div_1h_bearish": div_1h["bearish_div"],
+            "div_1h_bullish": div_1h["bullish_div"],
+            "div_4h_bearish": div_4h["bearish_div"],
+            "div_4h_bullish": div_4h["bullish_div"],
+        }
+
     def _score_with_weights(
         self,
         market_flow_context: Dict[str, Any],
@@ -1382,14 +1615,23 @@ class FundFlowDecisionEngine:
         features["macd_cross"] = max(-1.0, min(1.0, macd_cross_bias))
 
         macd_hist_delta = self._to_float(
-            tf_ctx.get("macd_hist_delta"),
-            self._to_float(tf_ctx.get("macd_5m_hist_delta"), 0.0),
+            tf_ctx.get("macd_hist_delta_norm"),
+            self._to_float(tf_ctx.get("macd_5m_hist_delta_norm"), 0.0),
         )
         if abs(macd_hist_delta) < 1e-9:
-            if bool(tf_ctx.get("macd_5m_hist_expand_up", False)):
-                macd_hist_delta = 1.0
-            elif bool(tf_ctx.get("macd_5m_hist_expand_down", False)):
-                macd_hist_delta = -1.0
+            macd_hist_delta = self._to_float(
+                tf_ctx.get("macd_hist_delta"),
+                self._to_float(tf_ctx.get("macd_5m_hist_delta"), 0.0),
+            )
+        if abs(macd_hist_delta) < 1e-9:
+            if bool(tf_ctx.get("macd_5m_hist_expand_up", False) or tf_ctx.get("macd_hist_flip_up", False)):
+                macd_hist_delta = 0.35
+            elif bool(tf_ctx.get("macd_5m_hist_expand_down", False) or tf_ctx.get("macd_hist_flip_down", False)):
+                macd_hist_delta = -0.35
+        if bool(tf_ctx.get("macd_bullish_divergence", False)):
+            macd_hist_delta = max(macd_hist_delta, 0.25)
+        if bool(tf_ctx.get("macd_bearish_divergence", False)):
+            macd_hist_delta = min(macd_hist_delta, -0.25)
         features["macd_hist_mom"] = max(-1.0, min(1.0, macd_hist_delta))
 
         # KDJ(J) 归一化值：优先读取 kdj_j_norm，回退使用 (J-50)/50
@@ -2668,16 +2910,77 @@ class FundFlowDecisionEngine:
         macd_hist_prev = self._to_float(tf5.get("prev", {}).get("macd_hist"), self._to_float(snap.get("macd_5m_hist_delta"), macd_hist))
         if abs(macd_hist_prev) == abs(macd_hist):
             macd_hist_prev = macd_hist - self._to_float(snap.get("macd_5m_hist_delta"), 0.0)
+        macd_hist_delta_norm = self._to_float(
+            snap.get("macd_5m_hist_delta_norm"),
+            self._to_float(tf5.get("macd_hist_delta_norm"), 0.0),
+        )
+        if abs(macd_hist_delta_norm) < 1e-9:
+            macd_hist_delta_norm = self._to_float(
+                snap.get("macd_hist_delta_norm"),
+                self._to_float(tf5.get("macd_hist_delta"), self._to_float(snap.get("macd_5m_hist_delta"), 0.0)),
+            )
+        macd_flip_long = bool(
+            snap.get("macd_5m_hist_flip_up", snap.get("macd_hist_flip_up", tf5.get("macd_hist_flip_up", False)))
+        )
+        macd_flip_short = bool(
+            snap.get("macd_5m_hist_flip_down", snap.get("macd_hist_flip_down", tf5.get("macd_hist_flip_down", False)))
+        )
+        macd_divergence_long = bool(
+            snap.get(
+                "macd_5m_bullish_divergence",
+                snap.get("macd_bullish_divergence", tf5.get("macd_bullish_divergence", False)),
+            )
+        )
+        macd_divergence_short = bool(
+            snap.get(
+                "macd_5m_bearish_divergence",
+                snap.get("macd_bearish_divergence", tf5.get("macd_bearish_divergence", False)),
+            )
+        )
+        hist_delta_norm_min = self._to_float(cfg.get("entry_macd_hist_delta_norm_min", 0.12), 0.12)
+        divergence_delta_norm_min = self._to_float(cfg.get("entry_macd_divergence_delta_norm_min", 0.08), 0.08)
+        divergence_enabled = bool(cfg.get("entry_macd_divergence_enabled", True))
         macd_trigger_long = bool(snap.get("macd_trigger_pass_long", False) or (macd_line > macd_signal and macd_hist > 0))
         macd_trigger_short = bool(snap.get("macd_trigger_pass_short", False) or (macd_line < macd_signal and macd_hist < 0))
-        macd_early_long = bool(snap.get("macd_early_pass_long", False) or (macd_hist > 0 and macd_hist >= macd_hist_prev))
-        macd_early_short = bool(snap.get("macd_early_pass_short", False) or (macd_hist < 0 and macd_hist <= macd_hist_prev))
+        macd_early_long = bool(
+            snap.get("macd_early_pass_long", False)
+            or macd_flip_long
+            or (macd_hist > 0 and macd_hist_delta_norm >= hist_delta_norm_min)
+            or (divergence_enabled and macd_divergence_long and macd_hist_delta_norm >= divergence_delta_norm_min)
+            or (macd_hist > 0 and macd_hist >= macd_hist_prev)
+        )
+        macd_early_short = bool(
+            snap.get("macd_early_pass_short", False)
+            or macd_flip_short
+            or (macd_hist < 0 and macd_hist_delta_norm <= -hist_delta_norm_min)
+            or (divergence_enabled and macd_divergence_short and macd_hist_delta_norm <= -divergence_delta_norm_min)
+            or (macd_hist < 0 and macd_hist <= macd_hist_prev)
+        )
+        macd_reversal_score_long = max(
+            0.0,
+            min(
+                1.0,
+                max(0.0, macd_hist_delta_norm)
+                + (0.35 if macd_flip_long else 0.0)
+                + (0.25 if macd_divergence_long else 0.0),
+            ),
+        )
+        macd_reversal_score_short = max(
+            0.0,
+            min(
+                1.0,
+                max(0.0, -macd_hist_delta_norm)
+                + (0.35 if macd_flip_short else 0.0)
+                + (0.25 if macd_divergence_short else 0.0),
+            ),
+        )
 
-        k_val = self._to_float(snap.get("kdj_k"), self._to_float(tf5.get("kdj_k"), 50.0))
-        d_val = self._to_float(snap.get("kdj_d"), self._to_float(tf5.get("kdj_d"), 50.0))
-        j_val = self._to_float(snap.get("kdj_j"), self._to_float(tf5.get("kdj_j"), 50.0))
-        kdj_ok_long = bool(snap.get("kdj_support_pass_long", False) or (k_val >= d_val or j_val >= k_val))
-        kdj_ok_short = bool(snap.get("kdj_support_pass_short", False) or (k_val <= d_val or j_val <= k_val))
+        # KDJ 已在 V3.1 中删除，不再使用
+        # k_val = self._to_float(snap.get("kdj_k"), self._to_float(tf5.get("kdj_k"), 50.0))
+        # d_val = self._to_float(snap.get("kdj_d"), self._to_float(tf5.get("kdj_d"), 50.0))
+        # j_val = self._to_float(snap.get("kdj_j"), self._to_float(tf5.get("kdj_j"), 50.0))
+        # kdj_ok_long = bool(snap.get("kdj_support_pass_long", False) or (k_val >= d_val or j_val >= k_val))
+        # kdj_ok_short = bool(snap.get("kdj_support_pass_short", False) or (k_val <= d_val or j_val <= k_val))
 
         hard_block_long = False
         hard_block_short = False
@@ -2696,18 +2999,15 @@ class FundFlowDecisionEngine:
         if require_macd_trigger:
             if not bool(macd_trigger_long):
                 if allow_macd_early and macd_early_long:
-                    soft_penalty_long += self._to_float(cfg.get("entry_soft_penalty_macd_early"), 0.03)
+                    soft_penalty_long += self._to_float(cfg.get("entry_soft_penalty_macd_early"), 0.02)
                 else:
-                    soft_penalty_long += self._to_float(cfg.get("entry_soft_penalty_no_macd"), 0.08)
+                    soft_penalty_long += self._to_float(cfg.get("entry_soft_penalty_no_macd"), 0.04)
             if not bool(macd_trigger_short):
                 if allow_macd_early and macd_early_short:
-                    soft_penalty_short += self._to_float(cfg.get("entry_soft_penalty_macd_early"), 0.03)
+                    soft_penalty_short += self._to_float(cfg.get("entry_soft_penalty_macd_early"), 0.02)
                 else:
-                    soft_penalty_short += self._to_float(cfg.get("entry_soft_penalty_no_macd"), 0.08)
-        if not bool(kdj_ok_long):
-            soft_penalty_long += self._to_float(cfg.get("entry_soft_penalty_no_kdj"), 0.04)
-        if not bool(kdj_ok_short):
-            soft_penalty_short += self._to_float(cfg.get("entry_soft_penalty_no_kdj"), 0.04)
+                    soft_penalty_short += self._to_float(cfg.get("entry_soft_penalty_no_macd"), 0.04)
+        # KDJ 惩罚已删除 (V3.1)
 
         return {
             "confluence_side": "BOTH",
@@ -2721,8 +3021,12 @@ class FundFlowDecisionEngine:
             "confluence_macd_trigger_short": bool(macd_trigger_short),
             "confluence_macd_early_long": bool(macd_early_long),
             "confluence_macd_early_short": bool(macd_early_short),
-            "confluence_kdj_ok_long": bool(kdj_ok_long),
-            "confluence_kdj_ok_short": bool(kdj_ok_short),
+            "confluence_macd_flip_long": bool(macd_flip_long),
+            "confluence_macd_flip_short": bool(macd_flip_short),
+            "confluence_macd_divergence_long": bool(macd_divergence_long),
+            "confluence_macd_divergence_short": bool(macd_divergence_short),
+            "confluence_macd_reversal_score_long": round(macd_reversal_score_long, 4),
+            "confluence_macd_reversal_score_short": round(macd_reversal_score_short, 4),
         }
 
     def _compute_ma10_macd_confluence(
@@ -2969,7 +3273,7 @@ class FundFlowDecisionEngine:
         open_short_th = self._to_float(cfg.get("short_open_threshold"), self.short_open_threshold)
         capture_open_th = self._to_float(cfg.get("trend_capture_min_score"), self.trend_capture_min_score)
         capture_gap = self._to_float(cfg.get("trend_capture_min_gap"), self.trend_capture_min_gap)
-        short_score_boost = max(
+        legacy_short_score_boost = max(
             0.0,
             self._to_float(
                 cfg.get("trend_capture_short_min_score_boost"),
@@ -2991,7 +3295,10 @@ class FundFlowDecisionEngine:
         )
         default_portion = self._to_float(cfg.get("default_target_portion"), self.default_portion)
         leverage = int(self._to_float(cfg.get("default_leverage"), self.default_leverage))
-        effective_short_th = open_short_th + short_score_boost
+        # Keep the configured short open threshold exact. Historical configs had an
+        # extra short-side score boost here, which made the live threshold higher
+        # than `short_open_threshold` and hard to reason about from logs.
+        effective_short_th = open_short_th
         effective_short_gap = capture_gap + short_gap_boost
         short_confirm_pass = (not short_require_confirm_3m) or confirm_3m_short
         trend_only_mode = bool(cfg.get("trend_only_mode", False))
@@ -3011,7 +3318,7 @@ class FundFlowDecisionEngine:
         )
         entry_high_score_exempt_short = self._to_float(
             cfg.get("entry_high_score_exempt_short"),
-            max(effective_short_th + 0.05, 0.14),
+            max(open_short_th + 0.05, 0.14),
         )
         adx_strong_trend_exempt = self._to_float(
             cfg.get("adx_strong_trend_exempt"),
@@ -3153,6 +3460,29 @@ class FundFlowDecisionEngine:
                 ):
                     entry_hard_filters.append("no_breakout_no_pullback_short")
 
+        if operation == Operation.BUY and bool(cfg.get("macd_reversal_exempt_enabled", True)):
+            if (
+                self._to_float(confluence.get("confluence_macd_reversal_score_long"), 0.0)
+                >= self._to_float(cfg.get("macd_reversal_exempt_min_strength"), 0.55)
+                and final_long >= self._to_float(cfg.get("macd_reversal_exempt_long_score"), 0.16)
+            ):
+                entry_hard_filters = [
+                    item
+                    for item in entry_hard_filters
+                    if item not in {"adx_slope_below_required", "no_breakout_no_pullback_long"}
+                ]
+        elif operation == Operation.SELL and bool(cfg.get("macd_reversal_exempt_enabled", True)):
+            if (
+                self._to_float(confluence.get("confluence_macd_reversal_score_short"), 0.0)
+                >= self._to_float(cfg.get("macd_reversal_exempt_min_strength"), 0.55)
+                and final_short >= self._to_float(cfg.get("macd_reversal_exempt_short_score"), 0.16)
+            ):
+                entry_hard_filters = [
+                    item
+                    for item in entry_hard_filters
+                    if item not in {"adx_slope_below_required", "no_breakout_no_pullback_short"}
+                ]
+
         entry_hard_filter_blocked = bool(entry_hard_filters)
         if entry_hard_filter_blocked:
             operation = Operation.HOLD
@@ -3188,6 +3518,9 @@ class FundFlowDecisionEngine:
                 "direction_neutral_trial_mode": str(regime_info.get("direction_neutral_trial_mode", "none")),
                 "direction_neutral_trial_reason": str(regime_info.get("direction_neutral_trial_reason", "")),
                 "short_entry_score_threshold": round(effective_short_th, 4),
+                "short_entry_score_threshold_configured": round(open_short_th, 4),
+                "short_entry_score_threshold_legacy_boost": round(legacy_short_score_boost, 4),
+                "short_entry_score_threshold_legacy_boost_applied": False,
                 "short_entry_gap_required": round(effective_short_gap, 4),
                 "short_entry_confirm_3m_required": bool(short_require_confirm_3m),
                 "short_entry_confirm_3m_pass": bool(confirm_3m_short),
@@ -4197,6 +4530,39 @@ class FundFlowDecisionEngine:
         elif ev_short and lw_long and abs(lw_score_val) >= 0.10:
             short_score *= 0.70
             direction_conflict = True
+
+        # ========== V3.1 新增：MACD 多周期信号计算 ==========
+        macd_multitf = self._compute_macd_multitf_signal(
+            market_flow_context=market_flow_context or {},
+            intended_long=(long_score > short_score),
+            intended_short=(short_score > long_score),
+            cfg=trend_cfg,
+        )
+        # 应用 MACD 多周期奖励/惩罚
+        long_score += macd_multitf.get("long_bonus", 0.0)
+        short_score += macd_multitf.get("short_bonus", 0.0)
+        long_penalty_macd = macd_multitf.get("long_penalty", 0.0)
+        short_penalty_macd = macd_multitf.get("short_penalty", 0.0)
+
+        
+        # ========== V3.1 新增：软惩罚上限保护 ==========
+        soft_penalty_max_pct = self._to_float(trend_cfg.get("soft_penalty_max_pct", 0.8))
+        soft_penalty_max_long = long_threshold * soft_penalty_max_pct
+        soft_penalty_max_short = short_threshold * soft_penalty_max_pct
+        
+        long_penalty = min(long_penalty, soft_penalty_max_long)
+        short_penalty = min(short_penalty, soft_penalty_max_short)
+
+        
+        # ========== V3.1 新增：HARD_BLOCK 夣=========
+        hard_block_long = bool(confluence_v2.get("confluence_hard_block_long", False))
+        hard_block_short = bool(confluence_v2.get("confluence_hard_block_short", False))
+        
+        # MACD 4H 背离 HARD_BLOCK (最高优先级)
+        if macd_multitf.get("hard_block_long", False):
+            hard_block_long = True
+        if macd_multitf.get("hard_block_short", False):
+            hard_block_short = True
 
         # ========== 方向不明确时禁止开仓 ==========
         # 当 direction 为 BOTH 且主指标都失效时，禁止开新仓

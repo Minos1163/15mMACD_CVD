@@ -1865,6 +1865,28 @@ class TradingBot:
             "entry_allow_macd_early": bool(raw.get("entry_allow_macd_early", True)),
             "entry_macd_early_hist_min": self._to_float(raw.get("entry_macd_early_hist_min", 0.0), 0.0),
             "entry_macd_early_expand_bars": max(1, int(self._to_float(raw.get("entry_macd_early_expand_bars", 2), 2))),
+            "entry_macd_hist_delta_norm_min": min(
+                1.0,
+                max(0.0, self._to_float(raw.get("entry_macd_hist_delta_norm_min", 0.12), 0.12)),
+            ),
+            "entry_macd_flip_hist_min": self._to_float(raw.get("entry_macd_flip_hist_min", 0.0), 0.0),
+            "entry_macd_divergence_enabled": bool(raw.get("entry_macd_divergence_enabled", True)),
+            "entry_macd_divergence_lookback": max(
+                4,
+                int(self._to_float(raw.get("entry_macd_divergence_lookback", 10), 10)),
+            ),
+            "entry_macd_divergence_hist_ratio": min(
+                1.0,
+                max(0.1, self._to_float(raw.get("entry_macd_divergence_hist_ratio", 0.85), 0.85)),
+            ),
+            "entry_macd_divergence_price_epsilon": min(
+                0.02,
+                max(0.0, self._to_float(raw.get("entry_macd_divergence_price_epsilon", 0.0), 0.0)),
+            ),
+            "entry_macd_divergence_delta_norm_min": min(
+                1.0,
+                max(0.0, self._to_float(raw.get("entry_macd_divergence_delta_norm_min", 0.08), 0.08)),
+            ),
             "entry_soft_penalty_no_macd": min(0.5, max(0.0, self._to_float(raw.get("entry_soft_penalty_no_macd", 0.08), 0.08))),
             "entry_soft_penalty_no_kdj": min(0.5, max(0.0, self._to_float(raw.get("entry_soft_penalty_no_kdj", 0.04), 0.04))),
             "entry_hard_block_against_ma10": bool(raw.get("entry_hard_block_against_ma10", True)),
@@ -2006,6 +2028,69 @@ class TradingBot:
     def _clip_unit(value: float) -> float:
         return max(-1.0, min(1.0, float(value)))
 
+    def _detect_macd_hist_divergence(
+        self,
+        closes: List[float],
+        hist: List[float],
+        *,
+        lookback: int = 10,
+        price_epsilon: float = 0.0,
+        hist_ratio: float = 0.85,
+    ) -> Dict[str, Any]:
+        span = max(4, int(lookback))
+        if len(closes) < span + 1 or len(hist) < span + 1:
+            return {
+                "bullish": False,
+                "bearish": False,
+                "bullish_score": 0.0,
+                "bearish_score": 0.0,
+            }
+
+        close_now = float(closes[-1])
+        hist_now = float(hist[-1])
+        past_closes = [float(x) for x in closes[-(span + 1) : -1]]
+        past_hist = [float(x) for x in hist[-(span + 1) : -1]]
+        if not past_closes or len(past_closes) != len(past_hist):
+            return {
+                "bullish": False,
+                "bearish": False,
+                "bullish_score": 0.0,
+                "bearish_score": 0.0,
+            }
+
+        high_idx = max(range(len(past_closes)), key=lambda i: past_closes[i])
+        low_idx = min(range(len(past_closes)), key=lambda i: past_closes[i])
+        prev_high_close = past_closes[high_idx]
+        prev_low_close = past_closes[low_idx]
+        prev_high_hist = past_hist[high_idx]
+        prev_low_hist = past_hist[low_idx]
+
+        bullish = False
+        bearish = False
+        bullish_score = 0.0
+        bearish_score = 0.0
+
+        if prev_high_close > 0.0 and prev_high_hist > 0.0:
+            price_makes_higher_high = close_now >= prev_high_close * (1.0 + max(0.0, float(price_epsilon)))
+            hist_lower_high = hist_now <= prev_high_hist * max(0.0, min(1.0, float(hist_ratio)))
+            if price_makes_higher_high and hist_lower_high:
+                bearish = True
+                bearish_score = self._clip_unit((prev_high_hist - hist_now) / max(abs(prev_high_hist), 1e-9))
+
+        if prev_low_close > 0.0 and prev_low_hist < 0.0:
+            price_makes_lower_low = close_now <= prev_low_close * (1.0 - max(0.0, float(price_epsilon)))
+            hist_higher_low = hist_now >= prev_low_hist * max(0.0, min(1.0, float(hist_ratio)))
+            if price_makes_lower_low and hist_higher_low:
+                bullish = True
+                bullish_score = self._clip_unit((hist_now - prev_low_hist) / max(abs(prev_low_hist), 1e-9))
+
+        return {
+            "bullish": bool(bullish),
+            "bearish": bool(bearish),
+            "bullish_score": float(bullish_score),
+            "bearish_score": float(bearish_score),
+        }
+
     def _macd_state_from_closes(
         self,
         closes: List[float],
@@ -2013,6 +2098,9 @@ class TradingBot:
         fast: int = 12,
         slow: int = 26,
         signal: int = 9,
+        divergence_lookback: int = 10,
+        divergence_price_epsilon: float = 0.0,
+        divergence_hist_ratio: float = 0.85,
     ) -> Dict[str, Any]:
         min_len = max(int(slow), int(signal)) + 5
         if len(closes) < min_len:
@@ -2020,11 +2108,20 @@ class TradingBot:
                 "macd": 0.0,
                 "signal": 0.0,
                 "hist": 0.0,
+                "hist_norm": 0.0,
+                "hist_delta": 0.0,
+                "hist_delta_norm": 0.0,
                 "cross": "NONE",
                 "zone": "NEAR_ZERO",
                 "hist_expand": False,
                 "hist_expand_up": False,
                 "hist_expand_down": False,
+                "hist_flip_up": False,
+                "hist_flip_down": False,
+                "bullish_divergence": False,
+                "bearish_divergence": False,
+                "bullish_divergence_score": 0.0,
+                "bearish_divergence_score": 0.0,
             }
         ema_fast = self._ema_series(closes, int(fast))
         ema_slow = self._ema_series(closes, int(slow))
@@ -2036,11 +2133,20 @@ class TradingBot:
                 "macd": 0.0,
                 "signal": 0.0,
                 "hist": 0.0,
+                "hist_norm": 0.0,
+                "hist_delta": 0.0,
+                "hist_delta_norm": 0.0,
                 "cross": "NONE",
                 "zone": "NEAR_ZERO",
                 "hist_expand": False,
                 "hist_expand_up": False,
                 "hist_expand_down": False,
+                "hist_flip_up": False,
+                "hist_flip_down": False,
+                "bullish_divergence": False,
+                "bearish_divergence": False,
+                "bullish_divergence_score": 0.0,
+                "bearish_divergence_score": 0.0,
             }
 
         m0, s0, h0 = float(macd_line[-1]), float(sig_line[-1]), float(hist[-1])
@@ -2062,20 +2168,37 @@ class TradingBot:
         hist_expand_down = hist[-1] < hist[-2] < hist[-3]
         hist_expand = abs(hist[-1]) > abs(hist[-2]) > abs(hist[-3])
         hist_delta = float(hist[-1] - hist[-2])
+        hist_flip_up = hist[-2] <= 0.0 < hist[-1]
+        hist_flip_down = hist[-2] >= 0.0 > hist[-1]
         tail = hist[-20:] if len(hist) >= 20 else hist
         hist_abs_mean = sum(abs(float(x)) for x in tail) / max(1, len(tail))
         hist_norm = self._clip_unit(h0 / max(hist_abs_mean * 2.5, 1e-9))
+        hist_delta_norm = self._clip_unit(hist_delta / max(hist_abs_mean * 1.25, 1e-9))
+        divergence = self._detect_macd_hist_divergence(
+            closes,
+            hist,
+            lookback=divergence_lookback,
+            price_epsilon=divergence_price_epsilon,
+            hist_ratio=divergence_hist_ratio,
+        )
         return {
             "macd": m0,
             "signal": s0,
             "hist": h0,
             "hist_norm": hist_norm,
             "hist_delta": hist_delta,
+            "hist_delta_norm": hist_delta_norm,
             "cross": cross,
             "zone": zone,
             "hist_expand": bool(hist_expand),
             "hist_expand_up": bool(hist_expand_up),
             "hist_expand_down": bool(hist_expand_down),
+            "hist_flip_up": bool(hist_flip_up),
+            "hist_flip_down": bool(hist_flip_down),
+            "bullish_divergence": bool(divergence.get("bullish", False)),
+            "bearish_divergence": bool(divergence.get("bearish", False)),
+            "bullish_divergence_score": float(divergence.get("bullish_score", 0.0)),
+            "bearish_divergence_score": float(divergence.get("bearish_score", 0.0)),
         }
 
     def _kdj_state_from_ohlc(
@@ -2263,12 +2386,18 @@ class TradingBot:
             fast=macd_exec_fast,
             slow=macd_exec_slow,
             signal=macd_exec_signal,
+            divergence_lookback=int(cfg.get("entry_macd_divergence_lookback", 10)),
+            divergence_price_epsilon=self._to_float(cfg.get("entry_macd_divergence_price_epsilon", 0.0), 0.0),
+            divergence_hist_ratio=self._to_float(cfg.get("entry_macd_divergence_hist_ratio", 0.85), 0.85),
         )
         macd_anchor_state = self._macd_state_from_closes(
             closes_anchor,
             fast=macd_anchor_fast,
             slow=macd_anchor_slow,
             signal=macd_anchor_signal,
+            divergence_lookback=int(cfg.get("entry_macd_divergence_lookback", 10)),
+            divergence_price_epsilon=self._to_float(cfg.get("entry_macd_divergence_price_epsilon", 0.0), 0.0),
+            divergence_hist_ratio=self._to_float(cfg.get("entry_macd_divergence_hist_ratio", 0.85), 0.85),
         )
         kdj_state = self._kdj_state_from_ohlc(
             highs_exec,
@@ -2295,16 +2424,41 @@ class TradingBot:
         kdj_cross = str(kdj_state.get("cross", "NONE")).upper()
         kdj_cross_bias = 1.0 if kdj_cross == "GOLDEN" else (-1.0 if kdj_cross == "DEAD" else 0.0)
         early_hist_min = self._to_float(cfg.get("entry_macd_early_hist_min", 0.0), 0.0)
+        flip_hist_min = self._to_float(cfg.get("entry_macd_flip_hist_min", early_hist_min), early_hist_min)
+        hist_delta_norm_min = self._to_float(cfg.get("entry_macd_hist_delta_norm_min", 0.12), 0.12)
+        divergence_enabled = bool(cfg.get("entry_macd_divergence_enabled", True))
+        divergence_delta_norm_min = self._to_float(cfg.get("entry_macd_divergence_delta_norm_min", 0.08), 0.08)
         macd_hist = self._to_float(macd_state.get("hist", 0.0), 0.0)
+        macd_hist_delta_norm = self._to_float(macd_state.get("hist_delta_norm", 0.0), 0.0)
+        macd_flip_up = bool(macd_state.get("hist_flip_up", False))
+        macd_flip_down = bool(macd_state.get("hist_flip_down", False))
+        macd_bullish_divergence = bool(macd_state.get("bullish_divergence", False))
+        macd_bearish_divergence = bool(macd_state.get("bearish_divergence", False))
         macd_early_pass_long = bool(
             cfg.get("entry_allow_macd_early", True)
-            and bool(macd_state.get("hist_expand_up", False))
-            and macd_hist >= early_hist_min
+            and (
+                (bool(macd_state.get("hist_expand_up", False)) and macd_hist >= early_hist_min)
+                or (macd_flip_up and macd_hist >= flip_hist_min)
+                or (macd_hist > 0.0 and macd_hist_delta_norm >= hist_delta_norm_min)
+                or (
+                    divergence_enabled
+                    and macd_bullish_divergence
+                    and macd_hist_delta_norm >= divergence_delta_norm_min
+                )
+            )
         )
         macd_early_pass_short = bool(
             cfg.get("entry_allow_macd_early", True)
-            and bool(macd_state.get("hist_expand_down", False))
-            and macd_hist <= -early_hist_min
+            and (
+                (bool(macd_state.get("hist_expand_down", False)) and macd_hist <= -early_hist_min)
+                or (macd_flip_down and macd_hist <= -flip_hist_min)
+                or (macd_hist < 0.0 and macd_hist_delta_norm <= -hist_delta_norm_min)
+                or (
+                    divergence_enabled
+                    and macd_bearish_divergence
+                    and macd_hist_delta_norm <= -divergence_delta_norm_min
+                )
+            )
         )
         macd_trigger_pass_long = macd_cross == str(cfg.get("buy_cross", "GOLDEN")).upper()
         macd_trigger_pass_short = macd_cross == str(cfg.get("sell_cross", "DEAD")).upper()
@@ -2336,6 +2490,8 @@ class TradingBot:
             "macd_15m_hist_norm": float(macd_state.get("hist_norm", 0.0)),
             "macd_5m_hist_delta": float(macd_state.get("hist_delta", 0.0)),
             "macd_15m_hist_delta": float(macd_state.get("hist_delta", 0.0)),
+            "macd_5m_hist_delta_norm": float(macd_state.get("hist_delta_norm", 0.0)),
+            "macd_15m_hist_delta_norm": float(macd_state.get("hist_delta_norm", 0.0)),
             "macd_exec_cross": str(macd_state.get("cross", "NONE")),
             "macd_15m_cross": str(macd_state.get("cross", "NONE")),
             "macd_5m_cross": str(macd_state.get("cross", "NONE")),
@@ -2349,16 +2505,29 @@ class TradingBot:
             "macd_15m_hist_expand_down": bool(macd_state.get("hist_expand_down", False)),
             "macd_5m_hist_expand_up": bool(macd_state.get("hist_expand_up", False)),
             "macd_5m_hist_expand_down": bool(macd_state.get("hist_expand_down", False)),
+            "macd_15m_hist_flip_up": bool(macd_state.get("hist_flip_up", False)),
+            "macd_15m_hist_flip_down": bool(macd_state.get("hist_flip_down", False)),
+            "macd_5m_hist_flip_up": bool(macd_state.get("hist_flip_up", False)),
+            "macd_5m_hist_flip_down": bool(macd_state.get("hist_flip_down", False)),
+            "macd_15m_bullish_divergence": bool(macd_state.get("bullish_divergence", False)),
+            "macd_15m_bearish_divergence": bool(macd_state.get("bearish_divergence", False)),
+            "macd_5m_bullish_divergence": bool(macd_state.get("bullish_divergence", False)),
+            "macd_5m_bearish_divergence": bool(macd_state.get("bearish_divergence", False)),
             "macd_1h": float(macd_anchor_state.get("macd", 0.0)),
             "macd_1h_signal": float(macd_anchor_state.get("signal", 0.0)),
             "macd_1h_hist": float(macd_anchor_state.get("hist", 0.0)),
             "macd_1h_hist_norm": float(macd_anchor_state.get("hist_norm", 0.0)),
             "macd_1h_hist_delta": float(macd_anchor_state.get("hist_delta", 0.0)),
+            "macd_1h_hist_delta_norm": float(macd_anchor_state.get("hist_delta_norm", 0.0)),
             "macd_1h_cross": str(macd_anchor_state.get("cross", "NONE")),
             "macd_1h_zone": str(macd_anchor_state.get("zone", "NEAR_ZERO")),
             "macd_1h_hist_expand": bool(macd_anchor_state.get("hist_expand", False)),
             "macd_1h_hist_expand_up": bool(macd_anchor_state.get("hist_expand_up", False)),
             "macd_1h_hist_expand_down": bool(macd_anchor_state.get("hist_expand_down", False)),
+            "macd_1h_hist_flip_up": bool(macd_anchor_state.get("hist_flip_up", False)),
+            "macd_1h_hist_flip_down": bool(macd_anchor_state.get("hist_flip_down", False)),
+            "macd_1h_bullish_divergence": bool(macd_anchor_state.get("bullish_divergence", False)),
+            "macd_1h_bearish_divergence": bool(macd_anchor_state.get("bearish_divergence", False)),
             "kdj_k": float(kdj_state.get("k", 50.0)),
             "kdj_d": float(kdj_state.get("d", 50.0)),
             "kdj_j": float(kdj_state.get("j", 50.0)),
@@ -2384,11 +2553,16 @@ class TradingBot:
             "macd_trigger_pass_short": bool(macd_trigger_pass_short),
             "macd_early_pass_long": bool(macd_early_pass_long),
             "macd_early_pass_short": bool(macd_early_pass_short),
+            "macd_hist_flip_up": bool(macd_flip_up),
+            "macd_hist_flip_down": bool(macd_flip_down),
+            "macd_bullish_divergence": bool(macd_bullish_divergence),
+            "macd_bearish_divergence": bool(macd_bearish_divergence),
             "kdj_support_pass_long": bool(kdj_support_pass_long),
             "kdj_support_pass_short": bool(kdj_support_pass_short),
             # DecisionEngine 读取的统一别名（避免只写 *_5m 导致主判特征缺失）
             "macd_hist_norm": float(macd_state.get("hist_norm", 0.0)),
             "macd_hist_delta": float(macd_state.get("hist_delta", 0.0)),
+            "macd_hist_delta_norm": float(macd_state.get("hist_delta_norm", 0.0)),
             "macd_cross": str(macd_state.get("cross", "NONE")),
             "macd_zone": str(macd_state.get("zone", "NEAR_ZERO")),
         }
@@ -2418,8 +2592,13 @@ class TradingBot:
                 ),
                 "macd_hist_norm": self._to_float(confluence.get("macd_hist_norm"), self._to_float(tf_ctx.get("macd_hist_norm"), 0.0)),
                 "macd_hist_delta": self._to_float(confluence.get("macd_hist_delta"), self._to_float(tf_ctx.get("macd_hist_delta"), 0.0)),
+                "macd_hist_delta_norm": self._to_float(confluence.get("macd_hist_delta_norm"), self._to_float(tf_ctx.get("macd_hist_delta_norm"), 0.0)),
                 "macd_cross": str(confluence.get("macd_cross", tf_ctx.get("macd_cross", "NONE"))),
                 "macd_zone": str(confluence.get("macd_zone", tf_ctx.get("macd_zone", "NEAR_ZERO"))),
+                "macd_hist_flip_up": bool(confluence.get("macd_hist_flip_up", tf_ctx.get("macd_hist_flip_up", False))),
+                "macd_hist_flip_down": bool(confluence.get("macd_hist_flip_down", tf_ctx.get("macd_hist_flip_down", False))),
+                "macd_bullish_divergence": bool(confluence.get("macd_bullish_divergence", tf_ctx.get("macd_bullish_divergence", False))),
+                "macd_bearish_divergence": bool(confluence.get("macd_bearish_divergence", tf_ctx.get("macd_bearish_divergence", False))),
                 "kdj_k": self._to_float(confluence.get("kdj_k"), self._to_float(tf_ctx.get("kdj_k"), 50.0)),
                 "kdj_d": self._to_float(confluence.get("kdj_d"), self._to_float(tf_ctx.get("kdj_d"), 50.0)),
                 "kdj_j": self._to_float(confluence.get("kdj_j"), self._to_float(tf_ctx.get("kdj_j"), 50.0)),
@@ -2473,6 +2652,10 @@ class TradingBot:
                     confluence.get("macd_1h_hist_delta"),
                     self._to_float(tf_anchor_ctx.get("macd_hist_delta"), 0.0),
                 ),
+                "macd_hist_delta_norm": self._to_float(
+                    confluence.get("macd_1h_hist_delta_norm"),
+                    self._to_float(tf_anchor_ctx.get("macd_hist_delta_norm"), 0.0),
+                ),
                 "macd_cross": str(confluence.get("macd_1h_cross", tf_anchor_ctx.get("macd_cross", "NONE"))),
                 "macd_zone": str(confluence.get("macd_1h_zone", tf_anchor_ctx.get("macd_zone", "NEAR_ZERO"))),
                 "macd_hist_expand": bool(
@@ -2483,6 +2666,18 @@ class TradingBot:
                 ),
                 "macd_hist_expand_down": bool(
                     confluence.get("macd_1h_hist_expand_down", tf_anchor_ctx.get("macd_hist_expand_down", False))
+                ),
+                "macd_hist_flip_up": bool(
+                    confluence.get("macd_1h_hist_flip_up", tf_anchor_ctx.get("macd_hist_flip_up", False))
+                ),
+                "macd_hist_flip_down": bool(
+                    confluence.get("macd_1h_hist_flip_down", tf_anchor_ctx.get("macd_hist_flip_down", False))
+                ),
+                "macd_bullish_divergence": bool(
+                    confluence.get("macd_1h_bullish_divergence", tf_anchor_ctx.get("macd_bullish_divergence", False))
+                ),
+                "macd_bearish_divergence": bool(
+                    confluence.get("macd_1h_bearish_divergence", tf_anchor_ctx.get("macd_bearish_divergence", False))
                 ),
                 "ma10": self._to_float(
                     confluence.get("ma10_1h"),
